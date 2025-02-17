@@ -1,0 +1,52 @@
+# apiVersion: triggers.tekton.dev/v1beta1
+# kind: EventListener
+# metadata:
+#   name: github-webhook-listener
+# spec:
+#   serviceAccountName: pipeline-serviceaccount
+#   triggers:
+#     - name: github-trigger
+#       bindings:
+#         - ref: github-trigger-binding
+#       template:
+#         ref: github-trigger-template
+
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: github-webhook-listener
+spec:
+  serviceAccountName: pipeline-serviceaccount
+  triggers:
+    - name: github-listener
+      interceptors:
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: 'true'
+            - name: overlays
+              value:
+                - key: branch
+                  expression: 'body.ref.split("/")[2]'
+      bindings:
+        - ref: github-trigger-binding
+      template:
+        ref: github-trigger-template
+
+
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: el-build-docker-image
+  labels:
+    app: tekton-listener
+spec:
+  selector:
+    eventlistener: github-webhook-listener  
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080

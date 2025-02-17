@@ -1,0 +1,87 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: github-trigger-template
+spec:
+  params:
+    - name: spring-application-name
+    - name: repo-url
+    - name: branch
+    - name: image-tag
+    - name: dockerhub-username
+      default: "vijayrarecongo"
+    - name: deployment-platform
+      default: "prod"
+    - name: jvm-options
+      default: "-Dspring.profiles.active=prod"
+    - name: nexus-repo-url
+      default: "http://nexus-lib.aidtaas.com:8081/repository/releases"
+    - name: nexus-username
+      default: "admin"
+    - name: nexus-password
+      default: "Mobius#^Pr0dD#pL097*XS"
+    - name: depth
+      default: "0"
+    - name: sonar-url
+      default: "https://sonarqube.gov-cloud.ai/" 
+    - name: sonar-token
+      default: "squ_70541cbbdda2527883c82e72772cf6e97a8cb9ec"
+    - name: sonar-scan
+      default: "true"
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        generateName: build-$(tt.params.spring-application-name)-
+      spec:
+        serviceAccountName: pipeline-serviceaccount
+        pipelineRef:
+          name: build-docker-image
+        params:
+          - name: spring-application-name
+            value: "$(tt.params.spring-application-name)"
+          - name: repo-url
+            value: "$(tt.params.repo-url)"
+          - name: branch
+            value: "$(tt.params.branch)"
+          - name: dockerhub-username
+            value: "$(tt.params.dockerhub-username)"
+          - name: image-tag
+            value: "$(tt.params.image-tag)"
+          - name: nexus-repo-url
+            value: "$(tt.params.nexus-repo-url)"
+          - name: nexus-username
+            value: "$(tt.params.nexus-username)"
+          - name: nexus-password
+            value: "$(tt.params.nexus-password)"
+          - name: deployment-platform
+            value: "$(tt.params.deployment-platform)"
+          - name: jvm-options
+            value: "$(tt.params.jvm-options)"
+          - name: depth
+            value: "0"
+          - name: sonar-url
+            value: $(tt.params.sonar-url)  
+          - name: sonar-token
+            value: $(tt.params.sonar-token)
+          - name: sonar-scan
+            value: $(tt.params.sonar-scan)
+        workspaces:
+          - name: shared-workspace
+            persistentVolumeClaim:
+              claimName: shared-workspace
+          - name: docker-config
+            secret:
+              secretName: docker-credentials
+          - name: github-secret
+            secret:
+              secretName: github-secret
+          - name: ssh-creds
+            secret: 
+              secretName: ssh-creds
+              
+
+
+
+
+

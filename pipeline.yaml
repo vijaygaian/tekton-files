@@ -1,0 +1,253 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-docker-image
+  namespace: default
+spec:
+  params:
+    - name: spring-application-name
+      type: string
+    - name: repo-url
+      type: string
+    - name: branch
+      type: string
+    - name: dockerhub-username
+      type: string
+    - name: image-tag
+      type: string
+    - name: nexus-repo-url
+      type: string
+    - name: nexus-username
+      type: string
+    - name: nexus-password
+      type: string
+    - name: deployment-platform
+      type: string
+    - name: jvm-options
+      type: string
+    - name: depth
+      type: string 
+    - name: sonar-url
+      type: string
+    - name: sonar-token
+      type: string
+    - name: sonar-scan
+      type: string
+  workspaces:
+    - name: shared-workspace
+    - name: docker-config
+    - name: github-secret
+    - name: ssh-creds  
+  tasks:
+    - name: clone-repository
+      taskRef:
+        name: git-clone
+        kind: Task
+      params:
+        - name: url
+          value: "$(params.repo-url)"
+        - name: revision
+          value: "$(params.branch)"
+        - name: depth
+          value: "$(params.depth)"
+        - name: deleteExisting
+          value: "true"
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+        - name: ssh-directory
+          workspace: ssh-creds
+    
+    - name: check-changes-in-application-master-properties
+      taskSpec:
+        results:
+          - name: modified
+            description: "Indicates if application-master.properties is modified"
+        steps:
+          - name: check-modifications
+            image: alpine:latest
+            script: |
+              #!/bin/sh
+              set -e
+              apk add --no-cache git
+              cd /workspace/shared-workspace
+              
+              if ! git rev-parse HEAD > /dev/null 2>&1; then
+                echo "No commits found. Exiting modification check."
+                echo -n "false" > /tekton/results/modified
+                exit 0
+              fi
+              
+              if [ "$(git rev-list --count HEAD)" -eq 1 ]; then
+                echo "Only one commit found, skipping modifications check."
+                echo -n "false" > /tekton/results/modified
+                exit 0
+              fi
+              
+              CURRENT_COMMIT=$(git rev-parse HEAD)
+              PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+              MODIFIED=$(git diff --name-only "$PREVIOUS_COMMIT" "$CURRENT_COMMIT" | grep 'src/main/resources/application-master.properties' || echo "")
+              
+              if [ -n "$MODIFIED" ]; then
+                echo -n "true" > /tekton/results/modified
+              else
+                echo -n "false" > /tekton/results/modified
+              fi
+      workspaces:
+        - name: shared-workspace
+          workspace: shared-workspace
+      runAfter:
+        - clone-repository
+
+    - name: update-service-configmap-with-modified-values
+      when:
+        - input: "$(tasks.check-changes-in-application-master-properties.results.modified)"
+          operator: in
+          values: ["true"]
+      taskSpec:
+        workspaces:
+          - name: shared-workspace
+          - name: github-secret
+        steps:
+          - name: modify-and-update-values
+            image: alpine:latest
+            script: |
+              #!/bin/sh
+              set -e
+              apk add --no-cache git bash curl jq python3 py3-pip py3-virtualenv
+              
+              echo "🔄 Cloning repository..."
+              cd /workspace/shared-workspace
+              
+              PROPERTYFILEPATH="src/main/resources/application-master.properties"
+              BRANCH="$(params.branch)"
+              VALUES_FILE_PATH="helm/$(params.spring-application-name)/values.yaml"
+              REMOTE_REPO="https://api.github.com/repos/vijaygaian/k8s-files/contents/$VALUES_FILE_PATH"
+              
+              echo "📥 Fetching values.yaml..."
+              TOKEN=$(cat /workspace/github-secret/token)
+              curl -s -H "Authorization: Bearer $TOKEN" \
+                   -H "Accept: application/vnd.github.v3.raw" \
+                   "$REMOTE_REPO?ref=$BRANCH" -o values.yaml
+              
+              if [ ! -s values.yaml ]; then
+                echo "❌ ERROR: Failed to fetch values.yaml."
+                exit 1
+              fi
+              
+              echo "🐍 Setting up Python Virtual Environment..."
+              python3 -m venv venv
+              source venv/bin/activate
+              pip install --no-cache-dir pyyaml ruamel.yaml requests
+              
+              echo "🛠 Modifying values.yaml..."
+              python3 docker/scripts/convert.py "$PROPERTYFILEPATH"
+              
+              echo "⬆️ Updating values.yaml in remote repository..."
+              NEW_CONTENT=$(base64 -w 0 values.yaml)
+              SHA=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                        -H "Accept: application/vnd.github.v3+json" \
+                        "$REMOTE_REPO?ref=$BRANCH" | jq -r .sha)
+              
+              curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+                   -H "Accept: application/vnd.github.v3+json" \
+                   -H "Content-Type: application/json" \
+                   "$REMOTE_REPO" \
+                   -d "{\"message\": \"Update values.yaml\", \"content\": \"$NEW_CONTENT\", \"sha\": \"$SHA\", \"branch\": \"$BRANCH\"}"
+              
+              deactivate
+              rm -rf venv
+      workspaces:
+        - name: shared-workspace
+          workspace: shared-workspace
+        - name: github-secret
+          workspace: github-secret
+      runAfter:
+        - check-changes-in-application-master-properties
+
+    - name: build-docker-image-pushed-to-dockerhub
+      taskSpec:
+        workspaces:
+          - name: shared-workspace
+        steps:
+          - name: kaniko-build
+            image: gcr.io/kaniko-project/executor:latest
+            command:
+              - /kaniko/executor
+            args:
+              - "--context=/workspace/shared-workspace"
+              - "--dockerfile=/workspace/shared-workspace/docker/Dockerfile"
+              - "--destination=$(params.dockerhub-username)/$(params.spring-application-name):$(params.image-tag)"
+              - "--build-arg=SPRING_APPLICATION_NAME=$(params.spring-application-name)"
+              - "--build-arg=NEXUS_URL=$(params.nexus-repo-url)"
+              - "--build-arg=NEXUS_USERNAME=$(params.nexus-username)"
+              - "--build-arg=NEXUS_PASSWORD=$(params.nexus-password)"
+              - "--build-arg=SONAR_HOST=$(params.sonar-url)"
+              - "--build-arg=SONAR_TOKEN=$(params.sonar-token)"
+              - "--build-arg=SONAR_SCAN=$(params.sonar-scan)"
+              - "--build-arg=DEPLOYMENT_PLATFORM=$(params.deployment-platform)"
+              - "--build-arg=JVM_OPTIONS=$(params.jvm-options)"
+            env:
+              - name: DOCKER_CONFIG
+                value: /kaniko/.docker
+            volumeMounts:
+              - name: kaniko-secret
+                mountPath: /kaniko/.docker
+        volumes:
+          - name: kaniko-secret
+            secret:
+              secretName: docker-credentials
+              items:
+                - key: .dockerconfigjson
+                  path: config.json  
+      workspaces:
+        - name: shared-workspace
+          workspace: shared-workspace
+      runAfter:
+        - update-service-configmap-with-modified-values
+
+    - name: update-image-in-values-yaml-file
+      taskSpec:
+        workspaces:
+          - name: github-secret 
+        steps:
+          - name: update-values-file
+            image: alpine:latest
+            script: |
+              #!/bin/sh
+              set -e
+
+              # Install curl and jq before using them
+              apk add --no-cache curl jq
+
+              export GITHUB_TOKEN=$(cat /workspace/github-secret/token) 
+
+              echo "Fetching values.yaml from GitHub..."
+              CONTENT_RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                                  -H "Accept: application/vnd.github.v3+json" \
+                                  "https://api.github.com/repos/vijaygaian/k8s-files/contents/helm/$(params.spring-application-name)/values.yaml?ref=main")
+
+              OLD_CONTENT=$(echo "$CONTENT_RESPONSE" | jq -r .content)
+              SHA=$(echo "$CONTENT_RESPONSE" | jq -r .sha)
+
+              if [ "$OLD_CONTENT" == "null" ] || [ "$SHA" == "null" ]; then
+                echo "Error: Failed to fetch values.yaml from GitHub!"
+                exit 1
+              fi
+
+              echo "Updating image tag to $(params.image-tag)..."
+              NEW_CONTENT=$(echo "$OLD_CONTENT" | base64 -d | sed -E "s|(image:\s*gaianmobius/$(params.spring-application-name):)[a-zA-Z0-9._-]+|\1$(params.image-tag)|g" | base64 -w0)
+
+              echo "Pushing updated values.yaml to GitHub..."
+              UPDATE_RESPONSE=$(curl -s -X PUT \
+                                      -H "Authorization: Bearer $GITHUB_TOKEN" \
+                                      -H "Accept: application/vnd.github.v3+json" \
+                                      "https://api.github.com/repos/vijaygaian/k8s-files/contents/helm/$(params.spring-application-name)/values.yaml" \
+                                      -d "{\"message\": \"Update deployment image\", \"content\": \"$NEW_CONTENT\", \"sha\": \"$SHA\", \"branch\": \"main\"}")
+
+              echo "Update Response: $UPDATE_RESPONSE"
+      workspaces:
+        - name: github-secret
+          workspace: github-secret 
+      runAfter:
+        - build-docker-image-pushed-to-dockerhub

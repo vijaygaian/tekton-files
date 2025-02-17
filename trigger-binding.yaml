@@ -1,0 +1,14 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-trigger-binding
+spec:
+  params:
+    - name: repo-url
+      value: "$(body.repository.ssh_url)"  
+    - name: branch
+      value: "$(body.repository.master_branch)"  
+    - name: spring-application-name
+      value: $(body.repository.name)
+    - name: image-tag
+      value: $(body.head_commit.id)
